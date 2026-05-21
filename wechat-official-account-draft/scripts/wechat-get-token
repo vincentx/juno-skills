@@ -1,0 +1,79 @@
+#!/usr/bin/env python3
+"""
+wechat-get-token — Get WeChat Official Account access token.
+
+Usage:
+  ./scripts/wechat-get-token --appid APPID --secret SECRET
+  ./scripts/wechat-get-token                    # reads WECHAT_APPID, WECHAT_APPSECRET from env
+
+Output (JSON):
+  {"success": true, "access_token": "...", "expires_in": 7200}
+  {"success": false, "error": "...", "errcode": ...}
+"""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+
+
+def get_token(appid: str, secret: str) -> dict:
+    """Call WeChat API to get access token."""
+    url = (
+        f"https://api.weixin.qq.com/cgi-bin/token"
+        f"?appid={appid}&secret={secret}&grant_type=client_credential"
+    )
+    result = subprocess.run(
+        ["curl", "-s", url],
+        capture_output=True, text=True, timeout=30
+    )
+
+    if result.returncode != 0:
+        return {"success": False, "error": f"curl failed: {result.stderr}"}
+
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError as e:
+        return {"success": False, "error": f"Invalid JSON response: {e}"}
+
+    if "access_token" in data:
+        return {
+            "success": True,
+            "access_token": data["access_token"],
+            "expires_in": data.get("expires_in", 7200)
+        }
+    else:
+        return {
+            "success": False,
+            "error": data.get("errmsg", "Unknown error"),
+            "errcode": data.get("errcode")
+        }
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Get WeChat Official Account access token",
+        epilog="Credentials: set WECHAT_APPID + WECHAT_APPSECRET env vars, or use --appid / --secret"
+    )
+    parser.add_argument("--appid", help="WeChat AppID (overrides WECHAT_APPID env)")
+    parser.add_argument("--secret", help="WeChat AppSecret (overrides WECHAT_APPSECRET env)")
+    args = parser.parse_args()
+
+    appid = args.appid or os.getenv("WECHAT_APPID")
+    secret = args.secret or os.getenv("WECHAT_APPSECRET")
+
+    if not appid or not secret:
+        print(json.dumps({
+            "success": False,
+            "error": "Missing credentials. Set WECHAT_APPID + WECHAT_APPSECRET or use --appid --secret"
+        }))
+        sys.exit(1)
+
+    result = get_token(appid, secret)
+    print(json.dumps(result, ensure_ascii=False))
+    sys.exit(0 if result.get("success") else 1)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,73 @@
+#!/usr/bin/env python3
+"""
+wechat-publish-draft — Submit a draft for publishing on WeChat Official Account.
+
+Usage:
+  ./scripts/wechat-publish-draft --token TOKEN --media-id MEDIA_ID
+
+Output (JSON):
+  {"success": true, "publish_id": "..."}
+  {"success": false, "error": "...", "errcode": ...}
+
+After submission, the draft is automatically removed from the draft box.
+Use the publish_id to check publish status via wechat-publish-status.
+"""
+
+import argparse
+import json
+import subprocess
+import sys
+
+
+def publish_draft(token: str, media_id: str) -> dict:
+    """Submit a draft for publishing."""
+    payload = json.dumps({"media_id": media_id})
+
+    result = subprocess.run(
+        [
+            "curl", "-s", "-X", "POST",
+            f"https://api.weixin.qq.com/cgi-bin/freepublish/submit?access_token={token}",
+            "-H", "Content-Type: application/json",
+            "-d", payload
+        ],
+        capture_output=True, text=True, timeout=30
+    )
+
+    if result.returncode != 0:
+        return {"success": False, "error": f"curl failed: {result.stderr}"}
+
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError as e:
+        return {"success": False, "error": f"Invalid JSON: {e}"}
+
+    if "publish_id" in data:
+        return {"success": True, "publish_id": data["publish_id"]}
+
+    return {
+        "success": False,
+        "error": data.get("errmsg", "Unknown error"),
+        "errcode": data.get("errcode")
+    }
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Submit a WeChat Official Account draft for publishing",
+        epilog="""Example:
+  ./scripts/wechat-publish-draft --token TOKEN --media-id pEG9dcVv78EdU8xhpULYj..."
+  
+Note: After submission, the draft is removed from the draft box automatically.
+        """
+    )
+    parser.add_argument("--token", required=True, help="WeChat access token")
+    parser.add_argument("--media-id", required=True, help="Media ID of the draft to publish")
+    args = parser.parse_args()
+
+    result = publish_draft(args.token, args.media_id)
+    print(json.dumps(result, ensure_ascii=False))
+    sys.exit(0 if result.get("success") else 1)
+
+
+if __name__ == "__main__":
+    main()

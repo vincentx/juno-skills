@@ -1,0 +1,116 @@
+#!/usr/bin/env python3
+"""
+wechat-upload-image — Upload an image to WeChat Official Account.
+
+Supports two modes:
+  --type material  → upload as permanent material (returns media_id, for cover images)
+  --type content   → upload as article content image (returns URL, for inline images)
+
+Usage:
+  ./scripts/wechat-upload-image --token TOKEN --file image.jpg --type material
+  ./scripts/wechat-upload-image --token TOKEN --file image.jpg --type content
+
+Output (JSON):
+  {"success": true, "media_id": "...", "url": "..."}       (material mode)
+  {"success": true, "url": "https://mmbiz.qpic.cn/..."}    (content mode)
+  {"success": false, "error": "...", "errcode": ...}
+"""
+
+import argparse
+import json
+import subprocess
+import sys
+
+
+def upload_material(token: str, filepath: str) -> dict:
+    """Upload image as permanent material (for cover/thumb_media_id)."""
+    result = subprocess.run(
+        [
+            "curl", "-s", "-X", "POST",
+            f"https://api.weixin.qq.com/cgi-bin/material/add_material?access_token={token}",
+            "-F", f"media=@{filepath}",
+            "-F", "type=image"
+        ],
+        capture_output=True, text=True, timeout=60
+    )
+    if result.returncode != 0:
+        return {"success": False, "error": f"curl failed: {result.stderr}"}
+
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError as e:
+        return {"success": False, "error": f"Invalid JSON: {e}"}
+
+    if "media_id" in data:
+        return {
+            "success": True,
+            "media_id": data["media_id"],
+            "url": data.get("url", "")
+        }
+    return {
+        "success": False,
+        "error": data.get("errmsg", "Unknown error"),
+        "errcode": data.get("errcode")
+    }
+
+
+def upload_content_image(token: str, filepath: str) -> dict:
+    """Upload image for use inside article content."""
+    result = subprocess.run(
+        [
+            "curl", "-s", "-X", "POST",
+            f"https://api.weixin.qq.com/cgi-bin/media/uploadimg?access_token={token}",
+            "-F", f"media=@{filepath}"
+        ],
+        capture_output=True, text=True, timeout=60
+    )
+    if result.returncode != 0:
+        return {"success": False, "error": f"curl failed: {result.stderr}"}
+
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError as e:
+        return {"success": False, "error": f"Invalid JSON: {e}"}
+
+    if "url" in data:
+        return {"success": True, "url": data["url"]}
+    return {
+        "success": False,
+        "error": data.get("errmsg", "Unknown error"),
+        "errcode": data.get("errcode")
+    }
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Upload image to WeChat Official Account",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Upload cover image (returns media_id for thumb_media_id)
+  ./scripts/wechat-upload-image --token TOKEN --file cover.jpg --type material
+
+  # Upload content image (returns URL for <img src="...">)
+  ./scripts/wechat-upload-image --token TOKEN --file photo.jpg --type content
+        """
+    )
+    parser.add_argument("--token", required=True, help="WeChat access token")
+    parser.add_argument("--file", required=True, help="Path to image file")
+    parser.add_argument(
+        "--type", required=True,
+        choices=["material", "content"],
+        help="'material' for permanent media (cover), 'content' for inline article images"
+    )
+    args = parser.parse_args()
+
+    if args.type == "material":
+        result = upload_material(args.token, args.file)
+    else:
+        result = upload_content_image(args.token, args.file)
+
+    print(json.dumps(result, ensure_ascii=False))
+    sys.exit(0 if result.get("success") else 1)
+
+
+if __name__ == "__main__":
+    main()

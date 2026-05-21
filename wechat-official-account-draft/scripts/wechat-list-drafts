@@ -1,0 +1,172 @@
+#!/usr/bin/env python3
+"""
+wechat-list-drafts — List drafts in WeChat Official Account draft box.
+
+Usage:
+  ./scripts/wechat-list-drafts --token TOKEN [--offset 0] [--count 10] [--no-content]
+
+Options:
+  --token TOKEN   WeChat access token [required]
+  --offset N      Starting position (default: 0)
+  --count N       Number to retrieve 1-20 (default: 10)
+  --no-content    Omit full article content (default: include content)
+
+Output (JSON):
+  {"success": true, "total_count": 5, "items": [...]}
+  {"success": false, "error": "..."}
+"""
+
+import argparse
+import json
+import subprocess
+import sys
+
+
+def list_drafts(token: str, offset: int = 0, count: int = 10, no_content: bool = False) -> dict:
+    """Get a list of drafts from the WeChat draft box."""
+    payload = json.dumps({
+        "offset": offset,
+        "count": min(count, 20),
+        "no_content": 1 if no_content else 0
+    })
+
+    result = subprocess.run(
+        [
+            "curl", "-s", "-X", "POST",
+            f"https://api.weixin.qq.com/cgi-bin/draft/batchget?access_token={token}",
+            "-H", "Content-Type: application/json",
+            "-d", payload
+        ],
+        capture_output=True, text=True, timeout=30
+    )
+
+    if result.returncode != 0:
+        return {"success": False, "error": f"curl failed: {result.stderr}"}
+
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError as e:
+        return {"success": False, "error": f"Invalid JSON: {e}"}
+
+    if "total_count" in data:
+        return {
+            "success": True,
+            "total_count": data["total_count"],
+            "items": data.get("item", data.get("items", []))
+        }
+
+    return {
+        "success": False,
+        "error": data.get("errmsg", "Unknown error"),
+        "errcode": data.get("errcode")
+    }
+
+
+def get_draft(token: str, media_id: str) -> dict:
+    """Get a specific draft's details."""
+    payload = json.dumps({"media_id": media_id})
+
+    result = subprocess.run(
+        [
+            "curl", "-s", "-X", "POST",
+            f"https://api.weixin.qq.com/cgi-bin/draft/get?access_token={token}",
+            "-H", "Content-Type: application/json",
+            "-d", payload
+        ],
+        capture_output=True, text=True, timeout=30
+    )
+
+    if result.returncode != 0:
+        return {"success": False, "error": f"curl failed: {result.stderr}"}
+
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError as e:
+        return {"success": False, "error": f"Invalid JSON: {e}"}
+
+    if "news_item" in data:
+        return {"success": True, "news_item": data["news_item"]}
+
+    return {
+        "success": False,
+        "error": data.get("errmsg", "Unknown error"),
+        "errcode": data.get("errcode")
+    }
+
+
+def count_drafts(token: str) -> dict:
+    """Get total count of drafts."""
+    result = subprocess.run(
+        [
+            "curl", "-s", "-X", "POST",
+            f"https://api.weixin.qq.com/cgi-bin/draft/count?access_token={token}",
+            "-H", "Content-Type: application/json"
+        ],
+        capture_output=True, text=True, timeout=30
+    )
+
+    if result.returncode != 0:
+        return {"success": False, "error": f"curl failed: {result.stderr}"}
+
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError as e:
+        return {"success": False, "error": f"Invalid JSON: {e}"}
+
+    if "total_count" in data:
+        return {"success": True, "total_count": data["total_count"]}
+
+    return {
+        "success": False,
+        "error": data.get("errmsg", "Unknown error"),
+        "errcode": data.get("errcode")
+    }
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="List and inspect WeChat official account drafts",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Sub-commands:
+  list       List drafts (default)
+  get        Get a specific draft by media_id
+  count      Get total draft count
+
+Examples:
+  ./scripts/wechat-list-drafts --token TOKEN list
+  ./scripts/wechat-list-drafts --token TOKEN list --no-content
+  ./scripts/wechat-list-drafts --token TOKEN get --media-id MEDIA_ID
+  ./scripts/wechat-list-drafts --token TOKEN count
+        """
+    )
+    parser.add_argument("--token", required=True, help="WeChat access token")
+    parser.add_argument("--offset", type=int, default=0, help="Starting offset")
+    parser.add_argument("--count", type=int, default=10, help="Number to retrieve (max 20)")
+    parser.add_argument("--no-content", action="store_true", help="Omit article content")
+    parser.add_argument("--media-id", help="Media ID for 'get' sub-command")
+
+    subparsers = parser.add_subparsers(dest="command", help="Sub-command (default: list)")
+    subparsers.add_parser("list")
+    subparsers.add_parser("get")
+    subparsers.add_parser("count")
+
+    args, _ = parser.parse_known_args()
+    cmd = args.command or "list"
+
+    if cmd == "get":
+        if not args.media_id:
+            print(json.dumps({"success": False, "error": "Missing --media-id for 'get' command"}))
+            sys.exit(1)
+        result = get_draft(args.token, args.media_id)
+    elif cmd == "count":
+        result = count_drafts(args.token)
+    else:
+        result = list_drafts(args.token, args.offset, args.count, args.no_content)
+
+    print(json.dumps(result, ensure_ascii=False))
+    sys.exit(0 if result.get("success") else 1)
+
+
+if __name__ == "__main__":
+    main()

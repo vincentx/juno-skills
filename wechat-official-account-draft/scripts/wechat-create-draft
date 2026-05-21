@@ -1,0 +1,176 @@
+#!/usr/bin/env python3
+"""
+wechat-create-draft — Create a draft article in WeChat Official Account.
+
+Usage:
+  ./scripts/wechat-create-draft --token TOKEN --title "Title" --content "<p>HTML</p>" [options]
+
+Options:
+  --title TEXT           Article title (max 32 chars) [required]
+  --content TEXT         Article HTML content [required]
+  --author TEXT          Author name (max 16 chars)
+  --digest TEXT          Article summary (max 128 chars)
+  --thumb TEXT           Permanent media_id for cover image [required for news]
+  --source-url URL       Original article URL ("read more" link)
+  --open-comment         1=enable comments (default), 0=disable
+  --fans-comment         1=fans only comment, 0=everyone (default)
+
+Output (JSON):
+  {"success": true, "media_id": "..."}
+  {"success": false, "error": "...", "errcode": ...}
+"""
+
+import argparse
+import json
+import re
+import subprocess
+import sys
+
+
+def markdown_to_html(text: str) -> str:
+    """Convert markdown text to HTML. Detects if already HTML and returns as-is."""
+    stripped = text.strip()
+
+    if '<' in stripped and '>' in stripped and any(
+        tag in stripped for tag in ['<p>', '<h', '<div', '<br', '<ul', '<ol']
+    ):
+        return stripped
+
+    # Try python-markdown
+    try:
+        import markdown as _md
+        return _md.markdown(stripped, extensions=['extra'])
+    except ImportError:
+        pass
+
+    # Simple fallback converter
+    lines = stripped.split('\n')
+    html = []
+    in_list = None
+
+    for line in lines:
+        if line.startswith('### '):
+            if in_list: html.append(f'</{in_list}>'); in_list = None
+            html.append(f'<h3>{line[4:]}</h3>')
+        elif line.startswith('## '):
+            if in_list: html.append(f'</{in_list}>'); in_list = None
+            html.append(f'<h2>{line[3:]}</h2>')
+        elif line.startswith('# '):
+            if in_list: html.append(f'</{in_list}>'); in_list = None
+            html.append(f'<h1>{line[2:]}</h1>')
+        elif line.strip().startswith('- '):
+            if in_list != 'ul':
+                if in_list: html.append(f'</{in_list}>')
+                in_list = 'ul'; html.append('<ul>')
+            html.append(f'<li>{line.strip()[2:]}</li>')
+        elif line.strip() and line.strip()[0].isdigit() and '. ' in line.strip()[:4]:
+            if in_list != 'ol':
+                if in_list: html.append(f'</{in_list}>')
+                in_list = 'ol'; html.append('<ol>')
+            idx = line.strip().index('. ')
+            html.append(f'<li>{line.strip()[idx+2:]}</li>')
+        elif not line.strip():
+            if in_list: html.append(f'</{in_list}>'); in_list = None
+        else:
+            if in_list: html.append(f'</{in_list}>'); in_list = None
+            if line.strip():
+                html.append(f'<p>{line}</p>')
+
+    if in_list: html.append(f'</{in_list}>')
+    result = '\n'.join(html)
+    result = re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', result)
+    result = re.sub(r'\*(.+?)\*', r'<em>\1</em>', result)
+    result = re.sub(r'`(.+?)`', r'<code>\1</code>', result)
+    result = re.sub(r'\[(.+?)\]\((.+?)\)', r'<a href="\2">\1</a>', result)
+    return result
+
+
+def create_draft(token: str, title: str, content: str, **kwargs) -> dict:
+    """Create a draft article in the WeChat draft box."""
+    article = {
+        "title": title,
+        "content": markdown_to_html(content),
+    }
+
+    if kwargs.get("author"):
+        article["author"] = kwargs["author"]
+    if kwargs.get("digest"):
+        article["digest"] = kwargs["digest"]
+    if kwargs.get("thumb"):
+        article["thumb_media_id"] = kwargs["thumb"]
+    if kwargs.get("source_url"):
+        article["content_source_url"] = kwargs["source_url"]
+    article["need_open_comment"] = 1 if kwargs.get("open_comment", True) else 0
+    article["only_fans_can_comment"] = 1 if kwargs.get("fans_comment", False) else 0
+
+    payload = json.dumps({"articles": [article]}, ensure_ascii=False)
+
+    result = subprocess.run(
+        [
+            "curl", "-s", "-X", "POST",
+            f"https://api.weixin.qq.com/cgi-bin/draft/add?access_token={token}",
+            "-H", "Content-Type: application/json",
+            "-d", payload
+        ],
+        capture_output=True, text=True, timeout=30
+    )
+
+    if result.returncode != 0:
+        return {"success": False, "error": f"curl failed: {result.stderr}"}
+
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError as e:
+        return {"success": False, "error": f"Invalid JSON: {e}"}
+
+    if "media_id" in data:
+        return {"success": True, "media_id": data["media_id"]}
+
+    return {
+        "success": False,
+        "error": data.get("errmsg", "Unknown error"),
+        "errcode": data.get("errcode")
+    }
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Create a draft article in WeChat Official Account",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  ./scripts/wechat-create-draft --token TOKEN --title "Hello" --content "<p>World</p>"
+  ./scripts/wechat-create-draft --token TOKEN --title "News" --content "<p>...</p>" --thumb MEDIA_ID --author "Juno"
+        """
+    )
+    parser.add_argument("--token", required=True, help="WeChat access token")
+    parser.add_argument("--title", required=True, help="Article title (max 32 chars)")
+    parser.add_argument("--content", required=True, help="Article HTML content")
+    parser.add_argument("--author", help="Author name (max 16 chars)")
+    parser.add_argument("--digest", help="Article summary (max 128 chars)")
+    parser.add_argument("--thumb", help="Cover image permanent media_id")
+    parser.add_argument("--source-url", help="Original article URL")
+    parser.add_argument("--open-comment", type=int, default=1, choices=[0, 1],
+                        help="Enable comments (default: 1)")
+    parser.add_argument("--fans-comment", type=int, default=0, choices=[0, 1],
+                        help="Fans only comment (default: 0)")
+    args = parser.parse_args()
+
+    result = create_draft(
+        token=args.token,
+        title=args.title,
+        content=args.content,
+        author=args.author,
+        digest=args.digest,
+        thumb=args.thumb,
+        source_url=args.source_url,
+        open_comment=bool(args.open_comment),
+        fans_comment=bool(args.fans_comment)
+    )
+
+    print(json.dumps(result, ensure_ascii=False))
+    sys.exit(0 if result.get("success") else 1)
+
+
+if __name__ == "__main__":
+    main()

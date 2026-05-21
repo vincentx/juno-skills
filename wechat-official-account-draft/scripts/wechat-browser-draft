@@ -1,0 +1,810 @@
+#!/usr/bin/env python3
+"""
+wechat-browser-draft — Create a WeChat Official Account draft via browser automation.
+
+QR code login only. Every step checks for session timeout and re-logins if needed.
+
+Usage:
+  ./scripts/wechat-browser-draft --title "Title" --content "<p>HTML</p>" [options]
+
+Options:
+  --title TEXT           Article title (max 32 chars) [required]
+  --content TEXT         Article HTML content [required]
+  --author TEXT          Author name (max 16 chars)
+  --digest TEXT          Article summary (max 128 chars)
+  --cover PATH           Cover image file path
+  --source-url URL       Original article URL ("read more")
+  --open-comment         1=enable comments (default), 0=disable
+  --fans-comment         1=fans only, 0=everyone (default)
+  --headless             Run headless (no visible browser window)
+  --timeout SECONDS      Max QR scan wait time in seconds (default: 120)
+
+Output (JSON):
+  {"success": true, "url": "https://mp.weixin.qq.com/...", "title": "..."}
+  {"success": false, "error": "..."}
+
+Requirements:
+  pip3 install playwright
+  python3 -m playwright install chromium
+"""
+
+import argparse
+import json
+import os
+import sys
+import time
+
+# ── Auto-install helper ────────────────────────────────────────────
+
+def _auto_install(package, pip_args=None, post_install_cmd=None):
+    """Try to pip-install a package. Returns True if successful."""
+    import subprocess
+    pip_cmd = pip_args if pip_args else [sys.executable, "-m", "pip", "install", package]
+    try:
+        print(f"ℹ️  Auto-installing {package}...")
+        result = subprocess.run(pip_cmd, capture_output=True, text=True, timeout=120)
+        if result.returncode != 0:
+            print(f"⚠️  pip install failed: {result.stderr.strip()}")
+            return False
+        if post_install_cmd:
+            print(f"ℹ️  Running post-install: {post_install_cmd}")
+            subprocess.run(post_install_cmd, shell=True, capture_output=True, text=True, timeout=120)
+        print(f"✅ Installed {package}")
+        return True
+    except Exception as e:
+        print(f"⚠️  Auto-install error: {e}")
+        return False
+
+# ── Playwright detection ──────────────────────────────────────────────
+_PLAYWRIGHT_AVAILABLE = False
+for _mod in ["playwright", "playwright.sync_api"]:
+    try:
+        exec(f"import {_mod}")
+        _PLAYWRIGHT_AVAILABLE = True
+        break
+    except ImportError:
+        continue
+
+if not _PLAYWRIGHT_AVAILABLE:
+    try:
+        sys.path.extend([
+            "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/site-packages",
+            os.path.expanduser("~/Library/Python/3.9/lib/python-scripts"),
+        ])
+        from playwright.sync_api import sync_playwright
+        _PLAYWRIGHT_AVAILABLE = True
+    except ImportError:
+        pass
+
+if not _PLAYWRIGHT_AVAILABLE:
+    # Try auto-install
+    if _auto_install("playwright"):
+        try:
+            from playwright.sync_api import sync_playwright
+            _PLAYWRIGHT_AVAILABLE = True
+        except ImportError:
+            pass
+    if _PLAYWRIGHT_AVAILABLE:
+        # Install browser binaries
+        import subprocess
+        subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"],
+                       capture_output=True, text=True, timeout=120)
+
+if not _PLAYWRIGHT_AVAILABLE:
+    print(json.dumps({
+        "success": False,
+        "error": (
+            "Playwright not found and auto-install failed. Install manually:\n"
+            "  pip3 install playwright && python3 -m playwright install chromium\n"
+        )
+    }))
+    sys.exit(1)
+
+from playwright.sync_api import sync_playwright
+
+
+# ── Markdown to HTML conversion ─────────────────────────────────────
+
+def markdown_to_html(text: str) -> str:
+    """Convert markdown text to HTML. Returns HTML if conversion succeeded,
+    or the original text if it's already HTML (contains <tag>)."""
+    stripped = text.strip()
+
+    # If it looks like HTML already, return as-is
+    if '<' in stripped and '>' in stripped and any(
+        tag in stripped for tag in ['<p>', '<h', '<div', '<br', '<ul', '<ol', '<table']
+    ):
+        return stripped
+
+    converters = []
+
+    # Try python-markdown library
+    try:
+        import markdown as _md
+        converters.append(lambda t: _md.markdown(t, extensions=['extra', 'codehilite']))
+    except ImportError:
+        if _auto_install("markdown"):
+            import markdown as _md
+            converters.append(lambda t: _md.markdown(t, extensions=['extra', 'codehilite']))
+
+    # Try mistune
+    try:
+        import mistune
+        converters.append(lambda t: mistune.html(t))
+    except ImportError:
+        if _auto_install("mistune"):
+            import mistune
+            converters.append(lambda t: mistune.html(t))
+
+    # Fallback: simple regex converter
+    def _simple_markdown(text: str) -> str:
+        """Convert basic markdown to HTML without external dependencies."""
+        lines = text.split('\n')
+        html = []
+        in_list = None  # None, 'ul', 'ol'
+
+        for line in lines:
+            # Headers
+            if line.startswith('### '):
+                if in_list: html.append(f'</{in_list}>'); in_list = None
+                html.append(f'<h3>{line[4:]}</h3>')
+            elif line.startswith('## '):
+                if in_list: html.append(f'</{in_list}>'); in_list = None
+                html.append(f'<h2>{line[3:]}</h2>')
+            elif line.startswith('# '):
+                if in_list: html.append(f'</{in_list}>'); in_list = None
+                html.append(f'<h1>{line[2:]}</h1>')
+            # Horizontal rule
+            elif line.strip() in ('---', '***', '___'):
+                if in_list: html.append(f'</{in_list}>'); in_list = None
+                html.append('<hr/>')
+            # Unordered list
+            elif line.strip().startswith('- ') or line.strip().startswith('* '):
+                if in_list != 'ul':
+                    if in_list: html.append(f'</{in_list}>')
+                    in_list = 'ul'
+                    html.append('<ul>')
+                html.append(f'<li>{line.strip()[2:]}</li>')
+            # Ordered list
+            elif line.strip() and line.strip()[0].isdigit() and '. ' in line.strip()[:4]:
+                if in_list != 'ol':
+                    if in_list: html.append(f'</{in_list}>')
+                    in_list = 'ol'
+                    html.append('<ol>')
+                idx = line.strip().index('. ')
+                html.append(f'<li>{line.strip()[idx+2:]}</li>')
+            # Empty line
+            elif not line.strip():
+                if in_list: html.append(f'</{in_list}>'); in_list = None
+            # Paragraph
+            else:
+                if in_list: html.append(f'</{in_list}>'); in_list = None
+                if line.strip():
+                    html.append(f'<p>{line}</p>')
+
+        if in_list:
+            html.append(f'</{in_list}>')
+
+        result = '\n'.join(html)
+
+        # Inline formatting
+        result = __import__('re').sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', result)
+        result = __import__('re').sub(r'\*(.+?)\*', r'<em>\1</em>', result)
+        result = __import__('re').sub(r'`(.+?)`', r'<code>\1</code>', result)
+        result = __import__('re').sub(r'\[(.+?)\]\((.+?)\)', r'<a href="\2">\1</a>', result)
+
+        return result
+
+    converters.append(_simple_markdown)
+
+    for converter in converters:
+        try:
+            result = converter(stripped)
+            if result and len(result) > 10:
+                return result
+        except Exception:
+            continue
+
+    # Last resort: wrap in <p> tags
+    return f'<p>{stripped}</p>'
+
+
+# ── Session helpers ───────────────────────────────────────────────────
+
+SESSION_TIMEOUT_KEYWORDS = ["登录超时", "login timeout", "请重新登录", "session expired"]
+
+
+def is_session_timeout(page) -> bool:
+    """Check if the current page is a session timeout page."""
+    try:
+        body_text = page.inner_text("body")
+        for kw in SESSION_TIMEOUT_KEYWORDS:
+            if kw.lower() in body_text.lower():
+                return True
+        return False
+    except Exception:
+        return False
+
+
+def ensure_session(page, timeout=120):
+    """
+    Check if session timed out. If yes, click login, let user re-scan QR.
+    Returns True once a valid session is confirmed.
+    """
+    if not is_session_timeout(page):
+        return True
+
+    print("\n⚠️  Session timed out! Re-login required.")
+    print("ℹ️  Looking for login link...")
+
+    # Click any element containing "登录" or "Log In"
+    login_clicked = False
+    for sel in [
+        'a:has-text("登录")',
+        'a:has-text("Log In")',
+        'a:has-text("log in")',
+        'a[href*="login"]',
+    ]:
+        try:
+            link = page.query_selector(sel)
+            if link and link.is_visible():
+                link.click()
+                login_clicked = True
+                print("✅ Clicked login link")
+                break
+        except Exception:
+            continue
+
+    if not login_clicked:
+        # Fallback: just navigate to home
+        page.goto("https://mp.weixin.qq.com/")
+        time.sleep(2)
+
+    # Wait for QR code to appear, then ask user to scan
+    print("ℹ️  Please scan the QR code with your WeChat app.")
+    print(f"⏳ Waiting up to {timeout} seconds...")
+
+    try:
+        page.wait_for_url(
+            lambda url: "cgi-bin/home" in url or "appmsg" in url or "token=" in url,
+            timeout=timeout * 1000
+        )
+        print("✅ Re-login successful")
+        return True
+    except Exception:
+        print("❌ Re-login failed or timed out")
+        return False
+
+
+def wait_for_editor(page, timeout=15):
+    """Wait for the editor page to fully load. Returns True if ready."""
+    try:
+        page.wait_for_load_state("networkidle", timeout=timeout * 1000)
+    except Exception:
+        pass
+    time.sleep(2)
+    return True
+
+
+# ── Main workflow ────────────────────────────────────────────────────
+
+def create_draft_via_browser(page, title, content, **kwargs):
+    """Create a draft article using WeChat web editor, with session checks."""
+
+    # ── Step 1: Navigate to draft editor ──
+    print("ℹ️  Step 1: Opening editor...")
+    page.goto("https://mp.weixin.qq.com/cgi-bin/home?t=home/index&lang=zh_CN")
+    if not ensure_session(page):
+        return {"success": False, "error": "Session timed out"}
+
+    # Use a single JS call for all navigation clicks
+    page.evaluate("""
+        (() => {
+            function clickText(text) {
+                const xpath = `//text()[contains(., '${text}')]`;
+                const result = document.evaluate(xpath, document, null,
+                    XPathResult.FIRST_ORDERED_NODE_TYPE, null);
+                if (!result.singleNodeValue) return false;
+                let el = result.singleNodeValue.parentElement;
+                for (let i = 0; i < 5; i++) {
+                    if (!el) break;
+                    if (el.offsetParent !== null) { el.click(); return true; }
+                    el = el.parentElement;
+                }
+                return false;
+            }
+            clickText('内容管理');
+        })()
+    """)
+    time.sleep(1)
+
+    page.evaluate("""
+        (() => {
+            function clickText(text) {
+                const xpath = `//text()[contains(., '${text}')]`;
+                const result = document.evaluate(xpath, document, null,
+                    XPathResult.FIRST_ORDERED_NODE_TYPE, null);
+                if (!result.singleNodeValue) return false;
+                let el = result.singleNodeValue.parentElement;
+                for (let i = 0; i < 5; i++) {
+                    if (!el) break;
+                    if (el.offsetParent !== null) { el.click(); return true; }
+                    el = el.parentElement;
+                }
+                return false;
+            }
+            clickText('草稿箱');
+        })()
+    """)
+    time.sleep(1)
+
+    # Click "新的创作" and then "文章" in the dropdown popup
+    page.evaluate("""
+        (() => {
+            function clickText(text) {
+                const xpath = `//text()[contains(., '${text}')]`;
+                const result = document.evaluate(xpath, document, null,
+                    XPathResult.FIRST_ORDERED_NODE_TYPE, null);
+                if (!result.singleNodeValue) return false;
+                let el = result.singleNodeValue.parentElement;
+                for (let i = 0; i < 5; i++) {
+                    if (!el) break;
+                    if (el.offsetParent !== null) { el.click(); return true; }
+                    el = el.parentElement;
+                }
+                return false;
+            }
+            clickText('新的创作');
+        })()
+    """)
+    time.sleep(0.5)
+
+    # Listen for popup and click "文章"
+    with page.context.expect_page() as popup_info:
+        page.evaluate("""
+            (() => {
+                function clickExact(text) {
+                    const xpath = `//text()[normalize-space(.)='${text}']`;
+                    const result = document.evaluate(xpath, document, null,
+                        XPathResult.FIRST_ORDERED_NODE_TYPE, null);
+                    if (!result.singleNodeValue) return false;
+                    let el = result.singleNodeValue.parentElement;
+                    for (let i = 0; i < 5; i++) {
+                        if (!el) break;
+                        if (el.offsetParent !== null) { el.click(); return true; }
+                        el = el.parentElement;
+                    }
+                    return false;
+                }
+                clickExact('文章');
+            })()
+        """)
+
+    # Switch to popup
+    popup = popup_info.value
+    popup.wait_for_load_state()
+    print("✅ Popup opened")
+    page = popup
+    time.sleep(1)
+
+    # ── Step 2: Fill in title ──
+    print(f"ℹ️  Step 2/6: Setting title...")
+    if not ensure_session(page):
+        return {"success": False, "error": "Session timed out before setting title"}
+
+    title_filled = False
+
+    # Method 1: ProseMirror paste (the VISIBLE title editor, textarea#title is hidden)
+    if not title_filled:
+        try:
+            title_filled = page.evaluate("""
+                function() {
+                    const pm = document.querySelector('.ProseMirror[data-placeholder*="\\u6807\\u9898"], .ProseMirror[placeholder*="\\u6807\\u9898"]');
+                    if (!pm) return false;
+                    pm.focus();
+                    // Clear existing
+                    while (pm.firstChild) pm.removeChild(pm.firstChild);
+                    // Paste plain text via ClipboardEvent
+                    const text = arguments[0].replace(/<[^>]*>/g, '');
+                    const dt = new DataTransfer();
+                    dt.setData('text/plain', text);
+                    pm.dispatchEvent(new ClipboardEvent('paste', {
+                        clipboardData: dt, bubbles: true, cancelable: true
+                    }));
+                    // Verify
+                    return pm.textContent.trim().length > 0;
+                }
+            """, title)
+            if title_filled:
+                print("✅ Title set (ProseMirror paste)")
+        except Exception as e:
+            print(f"⚠️  Title paste error: {e}")
+
+    # Method 2: Try filling textarea#title directly (Playwright fill)
+    if not title_filled:
+        try:
+            el = page.query_selector('textarea#title')
+            if el:
+                el.fill("")
+                el.fill(title)
+                title_filled = True
+                print("✅ Title set (textarea#title)")
+        except Exception:
+            pass
+
+    # Method 3: Any visible textarea
+    if not title_filled:
+        try:
+            tas = page.query_selector_all("textarea:visible")
+            for ta in tas:
+                try:
+                    ta.fill("")
+                    ta.fill(title)
+                    title_filled = True
+                    print("✅ Title set (visible textarea)")
+                    break
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+    if not title_filled:
+        # Debug: show what elements exist
+        try:
+            all_els = page.evaluate("""
+                Array.from(document.querySelectorAll('textarea, input, [contenteditable="true"]'))
+                    .filter(el => el.offsetParent !== null)
+                    .map(el => ({
+                        tag: el.tagName,
+                        id: el.id || '',
+                        name: el.name || '',
+                        placeholder: (el.getAttribute('data-placeholder') || el.getAttribute('placeholder') || el.placeholder || '').substring(0, 30),
+                        className: (el.className || '').substring(0, 40)
+                    }))
+                    .slice(0, 20)
+            """)
+            print(f"🔍 Input elements: {json.dumps(all_els, ensure_ascii=False)}")
+            page.screenshot(path="/tmp/wechat_debug_title.png")
+            print(f"🔍 Screenshot: /tmp/wechat_debug_title.png")
+        except Exception as e:
+            print(f"🔍 Debug: {e}")
+
+        print("")
+        print("=" * 50)
+        print("❌ 标题输入框未找到。浏览器保持打开。")
+        print("请在浏览器中检查页面，看看标题输入框在哪里。")
+        print("关闭浏览器窗口结束程序。")
+        print("=" * 50)
+        try:
+            page.wait_for_timeout(300000)
+        except KeyboardInterrupt:
+            pass
+        return {"success": False, "error": "Could not find or fill title field"}
+
+    # ── Step 3: Fill content ──
+    print("ℹ️  Step 3/6: Setting article content...")
+    if not ensure_session(page):
+        return {"success": False, "error": "Session timed out before setting content"}
+
+    # Convert markdown to HTML if needed
+    content_html = markdown_to_html(content)
+    if content_html != content:
+        print("ℹ️  Markdown detected, converted to HTML")
+
+    content_set = False
+
+    # Method 1: ProseMirror paste event (WeChat uses ProseMirror for body editor)
+    if not content_set:
+        try:
+            content_set = page.evaluate("""
+                function() {
+                    // Find the body ProseMirror (not the title one)
+                    const editors = document.querySelectorAll('.ProseMirror');
+                    let target = null;
+                    for (const ed of editors) {
+                        const ph = ed.getAttribute('data-placeholder') || ed.getAttribute('placeholder') || '';
+                        if (ph.includes('标题') || ph.includes('title')) continue;
+                        if (ed.offsetParent !== null) {
+                            target = ed;
+                            break;
+                        }
+                    }
+                    if (!target) return false;
+                    target.focus();
+
+                    // Clear existing content
+                    target.innerHTML = '';
+
+                    // Use ClipboardEvent paste with HTML data (ProseMirror handles this natively)
+                    const html = arguments[0];
+                    const dt = new DataTransfer();
+                    dt.setData('text/html', html);
+                    dt.setData('text/plain', html.replace(/<[^>]*>/g, ''));
+
+                    target.dispatchEvent(new ClipboardEvent('paste', {
+                        clipboardData: dt,
+                        bubbles: true,
+                        cancelable: true
+                    }));
+
+                    // Wait a frame for ProseMirror to process
+                    return new Promise(resolve => {
+                        requestAnimationFrame(() => {
+                            resolve(target.textContent.trim().length > 0);
+                        });
+                    });
+                }
+            """, content_html)
+            if content_set:
+                print("✅ Content set (ProseMirror paste)")
+        except Exception as e:
+            print(f"⚠️  ProseMirror paste error: {e}")
+
+    # Method 2: Try iframe inside editor area (UEditor fallback)
+    if not content_set:
+        try:
+            iframe_el = page.query_selector(".edui-editor iframe, .appmsg_editor iframe")
+            if iframe_el:
+                frame = iframe_el.content_frame()
+                if frame:
+                    frame.evaluate(f"document.body.innerHTML = `{content_html}`;")
+                    content_set = True
+                    print("✅ Content set (editor iframe)")
+        except Exception:
+            pass
+
+    # Method 3: execCommand as last resort
+    if not content_set:
+        try:
+            content_set = page.evaluate("""
+                function() {
+                    const editors = document.querySelectorAll('[contenteditable="true"]');
+                    let target = null;
+                    for (const ed of editors) {
+                        const ph = ed.getAttribute('data-placeholder') || '';
+                        if (ph.includes('标题') || ph.includes('title')) continue;
+                        if (ed.offsetParent !== null) {
+                            target = ed;
+                            break;
+                        }
+                    }
+                    if (!target) return false;
+                    target.focus();
+                    const sel = window.getSelection();
+                    sel.selectAllChildren(target);
+                    document.execCommand('delete');
+                    document.execCommand('insertHTML', false, arguments[0]);
+                    return new Promise(resolve => {
+                        requestAnimationFrame(() => {
+                            resolve(target.innerHTML.length > 0);
+                        });
+                    });
+                }
+            """, content_html)
+            if content_set:
+                print("✅ Content set (execCommand)")
+        except Exception:
+            pass
+
+    if not content_set:
+        print("⚠️  Could not set article content (will still try to save)")
+
+    # ── Step 4: Author ──
+    author = kwargs.get("author", "")
+    if author:
+        print(f"ℹ️  Setting author: {author}")
+        author_set = False
+        try:
+            el = page.query_selector('input#author')
+            if el:
+                el.fill("")
+                el.fill(author)
+                author_set = True
+                print("✅ Author set (input#author)")
+        except Exception:
+            pass
+        if not author_set:
+            try:
+                page.evaluate(f"""
+                    var inp = document.getElementById('author');
+                    if (inp) {{
+                        inp.value = `{author}`;
+                        inp.dispatchEvent(new Event('input', {{bubbles:true}}));
+                        inp.dispatchEvent(new Event('change', {{bubbles:true}}));
+                    }}
+                """)
+                author_set = True
+            except Exception:
+                pass
+        if not author_set:
+            print("⚠️  Could not set author")
+
+    digest = kwargs.get("digest", "")
+    if digest:
+        print(f"ℹ️  Setting digest...")
+        digest_set = False
+        try:
+            el = page.query_selector('textarea#js_description')
+            if el:
+                el.fill("")
+                el.fill(digest)
+                digest_set = True
+                print("✅ Digest set")
+        except Exception:
+            pass
+        if not digest_set:
+            try:
+                page.evaluate(f"""
+                    var ta = document.getElementById('js_description');
+                    if (ta) {{
+                        ta.value = `{digest}`;
+                        ta.dispatchEvent(new Event('input', {{bubbles:true}}));
+                        ta.dispatchEvent(new Event('change', {{bubbles:true}}));
+                    }}
+                """)
+                digest_set = True
+            except Exception:
+                pass
+
+    cover = kwargs.get("cover", "")
+    if cover and os.path.isfile(cover):
+        print(f"ℹ️  Uploading cover image...")
+        try:
+            file_input = page.query_selector('input[type="file"]')
+            if file_input:
+                file_input.set_input_files(cover)
+                time.sleep(3)
+        except Exception as e:
+            print(f"⚠️  Cover upload issue: {e}")
+
+    # ── Step 5: Save as draft ──
+    print("ℹ️  Step 5/5: Saving draft...")
+    if not ensure_session(page):
+        return {"success": False, "error": "Session timed out before saving"}
+
+    time.sleep(1)
+    saved = False
+    # Priority: exact "保存为草稿" first, then any "保存"
+    for sel in [
+        'button:has-text("保存为草稿")',
+        '.btn_primary:has-text("保存为草稿")',
+        'span:has-text("保存为草稿")',
+        'button:has-text("保存")',
+        'a:has-text("保存为草稿")',
+        'a:has-text("保存")',
+        '[class*="save"]',
+        '[class*="draft"]',
+        'a:has-text("save" i)',
+        'input[value*="保存"]',
+        'button[type="submit"]',
+    ]:
+        try:
+            btn = page.query_selector(sel)
+            if btn and btn.is_visible():
+                btn.click()
+                saved = True
+                break
+        except Exception:
+            continue
+
+    # Fallback: press Ctrl+S
+    if not saved:
+        try:
+            page.keyboard.press("Control+S")
+            saved = True
+        except Exception:
+            pass
+
+    if not saved:
+        return {"success": False, "error": "Could not find save button"}
+
+    # Wait for save to complete
+    time.sleep(3)
+    current_url = page.url
+
+    print("✅ Draft saved successfully")
+    return {
+        "success": True,
+        "url": current_url,
+        "title": title,
+        "message": "Draft created via browser automation. Check 草稿箱 at mp.weixin.qq.com"
+    }
+
+
+# ── Main ─────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Create a WeChat Official Account draft via browser automation",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""\
+Examples:
+  ./scripts/wechat-browser-draft --title "My Article" --content "<p>Hello</p>"
+  ./scripts/wechat-browser-draft --title "News" --content "<p>Body</p>" --author "Juno" --digest "Summary"
+
+All operations check for session timeout and auto-prompt re-login via QR scan.
+        """
+    )
+    parser.add_argument("--title", required=True, help="Article title (max 32 chars)")
+    parser.add_argument("--content", required=True, help="Article HTML content")
+    parser.add_argument("--author", help="Author name (max 16 chars)")
+    parser.add_argument("--digest", help="Article summary (max 128 chars)")
+    parser.add_argument("--cover", help="Cover image file path")
+    parser.add_argument("--source-url", help="Original article URL")
+    parser.add_argument("--open-comment", type=int, default=1, choices=[0, 1],
+                        help="Enable comments (default: 1)")
+    parser.add_argument("--fans-comment", type=int, default=0, choices=[0, 1],
+                        help="Fans only comment (default: 0)")
+    parser.add_argument("--headless", action="store_true",
+                        help="Run headless (no visible browser)")
+    parser.add_argument("--debug", action="store_true",
+                        help="Keep browser open after completion for manual verification")
+    parser.add_argument("--timeout", type=int, default=120,
+                        help="Max QR scan wait in seconds (default: 120)")
+    args = parser.parse_args()
+
+    print("ℹ️  Launching browser...")
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=args.headless,
+            args=["--disable-blink-features=AutomationControlled"]
+        )
+        context = browser.new_context(
+            viewport={"width": 1280, "height": 800},
+            user_agent=(
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/125.0.0.0 Safari/537.36"
+            )
+        )
+        page = context.new_page()
+
+        # Initial login
+        page.goto("https://mp.weixin.qq.com/")
+        time.sleep(2)
+
+        print("ℹ️  Please scan the QR code with your WeChat app to log in.")
+        print(f"⏳ Waiting up to {args.timeout} seconds...")
+        try:
+            page.wait_for_url(
+                lambda url: "cgi-bin/home" in url or "token=" in url,
+                timeout=args.timeout * 1000
+            )
+            print("✅ Login successful")
+        except Exception:
+            browser.close()
+            print(json.dumps({
+                "success": False,
+                "error": f"Login timed out after {args.timeout}s"
+            }))
+            sys.exit(1)
+
+        # Create draft (includes session checks at every step)
+        result = create_draft_via_browser(
+            page,
+            title=args.title,
+            content=args.content,
+            author=args.author,
+            digest=args.digest,
+            cover=args.cover,
+            source_url=args.source_url,
+        )
+
+        if result.get("success"):
+            print("\n✅ Draft created!")
+            if args.debug:
+                print("   --debug: Keeping browser open. Close manually or Ctrl+C.")
+                try:
+                    page.wait_for_timeout(300000)
+                except KeyboardInterrupt:
+                    pass
+            # Brief pause to ensure save is registered
+            time.sleep(1)
+
+        browser.close()
+        print(json.dumps(result, ensure_ascii=False))
+        sys.exit(0 if result.get("success") else 1)
+
+
+if __name__ == "__main__":
+    main()

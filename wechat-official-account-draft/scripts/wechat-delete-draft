@@ -1,0 +1,67 @@
+#!/usr/bin/env python3
+"""
+wechat-delete-draft — Delete a draft from WeChat Official Account.
+
+Usage:
+  ./scripts/wechat-delete-draft --token TOKEN --media-id MEDIA_ID
+
+Output (JSON):
+  {"success": true}
+  {"success": false, "error": "...", "errcode": ...}
+"""
+
+import argparse
+import json
+import subprocess
+import sys
+
+
+def delete_draft(token: str, media_id: str) -> dict:
+    """Delete a draft from the WeChat draft box."""
+    payload = json.dumps({"media_id": media_id})
+
+    result = subprocess.run(
+        [
+            "curl", "-s", "-X", "POST",
+            f"https://api.weixin.qq.com/cgi-bin/draft/delete?access_token={token}",
+            "-H", "Content-Type: application/json",
+            "-d", payload
+        ],
+        capture_output=True, text=True, timeout=30
+    )
+
+    if result.returncode != 0:
+        return {"success": False, "error": f"curl failed: {result.stderr}"}
+
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError as e:
+        return {"success": False, "error": f"Invalid JSON: {e}"}
+
+    if data.get("errcode") == 0:
+        return {"success": True}
+    return {
+        "success": False,
+        "error": data.get("errmsg", "Unknown error"),
+        "errcode": data.get("errcode")
+    }
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Delete a WeChat Official Account draft",
+        epilog="""Example:
+  ./scripts/wechat-delete-draft --token TOKEN --media-id pEG9dcVv78EdU8xhpULYj..."
+        """
+    )
+    parser.add_argument("--token", required=True, help="WeChat access token")
+    parser.add_argument("--media-id", required=True, help="Media ID of the draft to delete")
+    args = parser.parse_args()
+
+    result = delete_draft(args.token, args.media_id)
+    print(json.dumps(result, ensure_ascii=False))
+    sys.exit(0 if result.get("success") else 1)
+
+
+if __name__ == "__main__":
+    main()
