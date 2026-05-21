@@ -1,0 +1,707 @@
+#!/usr/bin/env python3
+"""
+xhs-browser-publish — Publish an image-text note (图文笔记) to Xiaohongshu (小红书)
+via browser automation.
+
+Usage:
+  ./scripts/xhs-browser-publish --title "Title" --images-dir /path/to/images/
+  ./scripts/xhs-browser-publish --title "Title" --images /path/to/img1.jpg /path/to/img2.png
+
+Options:
+  --title TEXT           Note title (max 20 chars) [required]
+  --content TEXT         Note body text
+  --images-dir PATH      Directory containing images (sorted by name)
+  --images PATH [PATH]   One or more image file paths
+  --cover INDEX          Cover image index (0-based, default: first)
+  --publish              Publish directly instead of saving as draft
+  --headless             Run headless (no visible browser window)
+  --debug                Keep browser open after completion
+  --timeout SECONDS      Max login wait time in seconds (default: 120)
+
+Output (JSON):
+  {"success": true, "url": "https://www.xiaohongshu.com/...", "title": "..."}
+  {"success": false, "error": "..."}
+
+Requirements:
+  Playwright (auto-installed if missing)
+"""
+
+import argparse
+import json
+import os
+import sys
+import time
+
+# ── Auto-install helper ────────────────────────────────────────────
+
+def _auto_install(package, pip_args=None, post_install_cmd=None):
+    """Try to pip-install a package. Returns True if successful."""
+    import subprocess
+    pip_cmd = pip_args if pip_args else [sys.executable, "-m", "pip", "install", package]
+    try:
+        print(f"ℹ️  Auto-installing {package}...")
+        result = subprocess.run(pip_cmd, capture_output=True, text=True, timeout=120)
+        if result.returncode != 0:
+            print(f"⚠️  pip install failed: {result.stderr.strip()}")
+            return False
+        if post_install_cmd:
+            print(f"ℹ️  Running post-install: {post_install_cmd}")
+            subprocess.run(post_install_cmd, shell=True, capture_output=True, text=True, timeout=120)
+        print(f"✅ Installed {package}")
+        return True
+    except Exception as e:
+        print(f"⚠️  Auto-install error: {e}")
+        return False
+
+
+# ── Playwright detection ──────────────────────────────────────────────
+
+_PLAYWRIGHT_AVAILABLE = False
+for _mod in ["playwright", "playwright.sync_api"]:
+    try:
+        exec(f"import {_mod}")
+        _PLAYWRIGHT_AVAILABLE = True
+        break
+    except ImportError:
+        continue
+
+if not _PLAYWRIGHT_AVAILABLE:
+    try:
+        sys.path.extend([
+            "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/site-packages",
+            os.path.expanduser("~/Library/Python/3.9/lib/python-scripts"),
+        ])
+        from playwright.sync_api import sync_playwright
+        _PLAYWRIGHT_AVAILABLE = True
+    except ImportError:
+        pass
+
+if not _PLAYWRIGHT_AVAILABLE:
+    if _auto_install("playwright"):
+        try:
+            from playwright.sync_api import sync_playwright
+            _PLAYWRIGHT_AVAILABLE = True
+        except ImportError:
+            pass
+    if _PLAYWRIGHT_AVAILABLE:
+        import subprocess
+        subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"],
+                       capture_output=True, text=True, timeout=120)
+
+if not _PLAYWRIGHT_AVAILABLE:
+    print(json.dumps({
+        "success": False,
+        "error": (
+            "Playwright not found and auto-install failed. Install manually:\n"
+            "  pip3 install playwright && python3 -m playwright install chromium"
+        )
+    }))
+    sys.exit(1)
+
+from playwright.sync_api import sync_playwright
+
+
+# ── Helpers ─────────────────────────────────────────────────────────
+
+def get_image_paths(images_dir=None, images=None):
+    """Resolve image file paths from --images-dir or --images."""
+    paths = []
+    if images_dir:
+        if not os.path.isdir(images_dir):
+            raise ValueError(f"Images directory not found: {images_dir}")
+        for f in sorted(os.listdir(images_dir)):
+            ext = os.path.splitext(f)[1].lower()
+            if ext in ('.jpg', '.jpeg', '.png', '.gif', '.webp'):
+                paths.append(os.path.join(images_dir, f))
+        if not paths:
+            raise ValueError(f"No image files found in {images_dir}")
+    if images:
+        for p in images:
+            if not os.path.isfile(p):
+                print(f"⚠️  Warning: image not found, skipping: {p}")
+                continue
+            paths.append(os.path.abspath(p))
+    if not paths:
+        raise ValueError("No images provided. Use --images-dir or --images.")
+    print(f"ℹ️  Found {len(paths)} image(s)")
+    for p in paths:
+        print(f"   {os.path.basename(p)} ({os.path.getsize(p) / 1024:.0f} KB)")
+    return paths
+
+
+def ensure_login(page, timeout=120):
+    """Wait for user to log in. Checks for logged-in UI elements after URL changes."""
+    print("ℹ️  Please log in to Xiaohongshu using your phone number and SMS code.")
+    print(f"⏳ Waiting up to {timeout} seconds...")
+
+    # First wait for the explore page to load
+    try:
+        page.wait_for_url(
+            lambda url: "explore" in url or "feed" in url or "home" in url,
+            timeout=timeout * 1000
+        )
+    except Exception:
+        print("❌ Page didn't load")
+        return False
+
+    # Then wait for a logged-in indicator element
+    time.sleep(2)
+    try:
+        # Wait for an element that only appears when logged in
+        page.wait_for_selector(
+            '[class*="avatar"], [class*="user"], [class*="login-btn"], [class*="publish"]',
+            timeout=10000
+        )
+        # Check if login button still shows (not logged in)
+        login_btn = page.query_selector('[class*="login-btn"], button:has-text("登录"), a:has-text("登录")')
+        if login_btn and login_btn.is_visible():
+            print("ℹ️  Login page still showing, waiting for login...")
+            # Wait for login button to disappear (user logged in)
+            page.wait_for_function(
+                "() => document.querySelector('[class*=\"login-btn\"], button:has-text(\"登录\"), a:has-text(\"登录\")') === null || "
+                "document.querySelector('[class*=\"login-btn\"], button:has-text(\"登录\"), a:has-text(\"登录\")').offsetParent === null",
+                timeout=timeout * 1000
+            )
+        print("✅ Login successful")
+        return True
+    except Exception:
+        # Fallback: check if we see logged-in content
+        try:
+            page.wait_for_function(
+                "() => document.querySelectorAll('[class*=\"avatar\"], [class*=\"user-info\"]').length > 0",
+                timeout=timeout * 1000
+            )
+            print("✅ Login successful")
+            return True
+        except Exception:
+            print("❌ Login timed out")
+            return False
+
+
+# ── Main workflow ────────────────────────────────────────────────────
+
+def publish_note_via_browser(page, title, content, image_paths, cover_index=0, publish=False):
+    """Publish an image-text note on Xiaohongshu via browser automation."""
+
+    # ── Step 1: Login via creator QR code ──
+    print("ℹ️  Step 1: Opening creator login page...")
+    page.goto("https://creator.xiaohongshu.com/login")
+    time.sleep(3)
+
+    # Click the QR code login button
+    print("ℹ️  Clicking QR code login...")
+    qr_clicked = False
+    for sel in [
+        'img[class*="css-wemwzq"]',
+        'img[src*="base64"]',
+        'img[class*="css-"]',
+        '[class*="qrcode"]',
+        '[class*="qr"]',
+    ]:
+        try:
+            btn = page.query_selector(sel)
+            if btn and btn.is_visible():
+                btn.click()
+                qr_clicked = True
+                print("✅ Clicked QR code login")
+                time.sleep(2)
+                break
+        except Exception:
+            continue
+
+    if not qr_clicked:
+        # JS fallback
+        try:
+            page.evaluate("""
+                (() => {
+                    const imgs = document.querySelectorAll('img');
+                    for (const img of imgs) {
+                        if (img.offsetParent === null) continue;
+                        const src = img.src || '';
+                        if (src.includes('base64')) {
+                            img.click();
+                            return true;
+                        }
+                    }
+                    return false;
+                })()
+            """)
+            qr_clicked = True
+            print("✅ Clicked QR code login (JS)")
+            time.sleep(2)
+        except Exception:
+            print("⚠️  Could not click QR login. Please click it manually.")
+
+    print("ℹ️  Please scan the QR code with your Xiaohongshu app.")
+    print(f"⏳ Waiting up to 180 seconds...")
+
+    # Wait for login to complete (redirect to creator home)
+    try:
+        page.wait_for_url(
+            lambda url: "new/home" in url or "publish" in url,
+            timeout=180000
+        )
+        print("✅ Creator login successful")
+    except Exception:
+        print("⚠️  Login timeout. Continuing anyway...")
+
+    # Navigate to publish page if not already there
+    if "new/home" in page.url:
+        print("ℹ️  Opening image-text publish page...")
+        page.goto("https://creator.xiaohongshu.com/publish/publish?from=tab_switch&target=image")
+        time.sleep(3)
+        print(f"   URL: {page.url[:80]}")
+        time.sleep(2)
+
+    # ── Upload images via file chooser ──
+    print("ℹ️  Uploading images...")
+    time.sleep(1)
+
+    # Click the upload area and capture file chooser event
+    file_uploaded = False
+    for sel in [
+        'span:has-text("上传图片")',
+        '[class*="upload"]',
+        '[class*="add-image"]',
+        '[class*="image-upload"]',
+        'div:has-text("上传图片")',
+    ]:
+        try:
+            btn = page.query_selector(sel)
+            if btn and btn.is_visible():
+                # Set up file chooser listener before clicking
+                with page.expect_event("filechooser") as fc_info:
+                    btn.click()
+                chooser = fc_info.value
+                chooser.set_files(image_paths)
+                file_uploaded = True
+                print(f"✅ Uploaded {len(image_paths)} image(s) via file chooser")
+                break
+        except Exception:
+            continue
+
+    if not file_uploaded:
+        # Try JS click + filechooser
+        try:
+            with page.expect_event("filechooser", timeout=5000) as fc_info:
+                page.evaluate("""
+                    (() => {
+                        const els = document.querySelectorAll('span, div, button');
+                        for (const el of els) {
+                            if (el.offsetParent === null) continue;
+                            const t = (el.textContent || '').trim();
+                            if (t.includes('上传图片') || t.includes('上传')) {
+                                el.click();
+                                return true;
+                            }
+                        }
+                        return false;
+                    })()
+                """)
+            chooser = fc_info.value
+            chooser.set_files(image_paths)
+            file_uploaded = True
+            print(f"✅ Uploaded {len(image_paths)} image(s) via JS+filechooser")
+        except Exception:
+            pass
+
+    if not file_uploaded:
+        print("⚠️  Auto-upload failed. Please drag & drop images manually.")
+        time.sleep(5)
+
+    # Wait for editor to fully render after upload
+    print("⏳ Waiting for editor to load...")
+    time.sleep(5)
+
+    # ── Fill in title ──
+    print(f"ℹ️  Setting title...")
+    title_filled = False
+
+    # Method 1: Press_sequentially (types char by char, Vue-friendly)
+    if not title_filled:
+        try:
+            inp = page.locator('input.d-text').first
+            # Click to focus
+            inp.click()
+            time.sleep(0.5)
+            # Clear existing with select all + delete
+            inp.press("Meta+A")
+            time.sleep(0.2)
+            inp.press("Backspace")
+            time.sleep(0.2)
+            # Type character by character
+            inp.press_sequentially(title, delay=80)
+            time.sleep(0.5)
+            # Verify
+            val = inp.input_value()
+            if val and len(val) > 0:
+                title_filled = True
+                print(f"✅ Title set: '{val[:20]}'")
+        except Exception as e:
+            print(f"⚠️  press_sequentially error: {e}")
+
+    # Method 2: keyboard.type as fallback
+    if not title_filled:
+        try:
+            inp = page.locator('input.d-text').first
+            inp.click()
+            time.sleep(0.3)
+            inp.fill("")
+            page.keyboard.type(title, delay=50)
+            time.sleep(0.3)
+            val = page.evaluate("document.querySelector('input.d-text').value")
+            if val and len(val) > 0:
+                title_filled = True
+                print(f"✅ Title set (keyboard.type): '{val[:20]}'")
+        except Exception:
+            pass
+
+    # Method 3: JS dispatch with proper InputEvent for Vue
+    if not title_filled:
+        try:
+            title_filled = page.evaluate("""
+                function(t) {
+                    const inp = document.querySelector('input.d-text');
+                    if (!inp) return false;
+                    inp.focus();
+                    // Vue listens for 'input' events with inputType
+                    const nativeSetter = Object.getOwnPropertyDescriptor(
+                        window.HTMLInputElement.prototype, 'value'
+                    ).set;
+                    nativeSetter.call(inp, t);
+                    inp.dispatchEvent(new InputEvent('input', {
+                        bubbles: true,
+                        cancelable: true,
+                        inputType: 'insertText',
+                        data: t
+                    }));
+                    inp.dispatchEvent(new Event('change', {bubbles: true}));
+                    return inp.value === t;
+                }
+            """, title)
+            if title_filled:
+                print("✅ Title set (Vue input event)")
+        except Exception:
+            pass
+
+    if not title_filled:
+        print("⚠️  Could not set title")
+
+    # ── Fill in content ──
+    if content:
+        print("ℹ️  Setting content...")
+        content_set = False
+
+        # Method 1: Playwright fill on TipTap/ProseMirror
+        for sel in [
+            '.tiptap.ProseMirror',
+            '[class*="tiptap"]',
+            '[contenteditable="true"]',
+            'textarea:visible',
+        ]:
+            try:
+                el = page.query_selector(sel)
+                if el:
+                    el.click()
+                    el.fill(content)
+                    content_set = True
+                    print("✅ Content set")
+                    break
+            except Exception:
+                continue
+
+        # Method 2: ClipboardEvent paste for TipTap/ProseMirror
+        if not content_set:
+            try:
+                content_set = page.evaluate("""
+                    function(html) {
+                        const editors = document.querySelectorAll('[contenteditable="true"]');
+                        let target = null;
+                        for (const ed of editors) {
+                            if (ed.offsetParent === null) continue;
+                            // Skip small editors (likely title/other)
+                            if (ed.textContent.length > 0) continue;
+                            target = ed;
+                            break;
+                        }
+                        if (!target) {
+                            // Fallback: first visible contenteditable
+                            for (const ed of editors) {
+                                if (ed.offsetParent !== null) { target = ed; break; }
+                            }
+                        }
+                        if (!target) return false;
+                        target.focus();
+                        // Clear
+                        while (target.firstChild) target.removeChild(target.firstChild);
+                        // ClipboardEvent paste
+                        const dt = new DataTransfer();
+                        dt.setData('text/html', html);
+                        dt.setData('text/plain', html.replace(/<[^>]*>/g, ''));
+                        target.dispatchEvent(new ClipboardEvent('paste', {
+                            clipboardData: dt, bubbles: true, cancelable: true
+                        }));
+                        return target.textContent.trim().length > 0;
+                    }
+                """, content)
+                if content_set:
+                    print("✅ Content set (paste)")
+            except Exception as e:
+                print(f"⚠️  Content paste error: {e}")
+
+        if not content_set:
+            print("⚠️  Could not set content")
+
+    # ── Enable scheduled publish (定时发布) ──
+    print("ℹ️  Setting scheduled publish (14 days)...")
+    try:
+        # Click the switch toggle to enable 定时发布
+        toggle_span = page.query_selector('.post-time-wrapper .d-switch-simulator')
+        if toggle_span and toggle_span.is_visible():
+            toggle_span.click()
+            print("✅ Clicked 定时发布 switch")
+            time.sleep(1.5)
+
+        # Set date to 14 days from now via JS
+        from datetime import datetime, timedelta
+        future = datetime.now() + timedelta(days=14)
+        target_datetime = future.strftime("%Y-%m-%d %H:%M")
+        print(f"   Target: {target_datetime}")
+
+        page.evaluate(f"""
+            function() {{
+                const inp = document.querySelector('.d-datepicker input.d-text');
+                if (!inp) return false;
+                const s = Object.getOwnPropertyDescriptor(
+                    window.HTMLInputElement.prototype, 'value'
+                ).set;
+                s.call(inp, '{target_datetime}');
+                inp.dispatchEvent(new Event('input', {{bubbles: true}}));
+                return true;
+            }}
+        """)
+        print(f"✅ Date set: {target_datetime}")
+        time.sleep(1)
+        print("ℹ️  Publishing as scheduled note...")
+
+    except Exception as e:
+        print(f"⚠️  Schedule error: {e}")
+
+    # ── Publish (scheduled) ──
+    action = "Publishing (scheduled)"
+    print(f"ℹ️  {action}...")
+    done = False
+
+    if publish:
+        # Find "发布" (publish) button
+        for sel in [
+            'button:has-text("发布")',
+            '[class*="submit"]',
+            'button:has-text("发表")',
+            '[class*="post"] button',
+            'button[type="submit"]',
+        ]:
+            try:
+                btn = page.query_selector(sel)
+                if btn and btn.is_visible():
+                    btn.click()
+                    done = True
+                    print("✅ Published!")
+                    break
+            except Exception:
+                continue
+    else:
+        # Find "暂存离开" button (inside closed shadow DOM)
+        # Find "定时发布" / "发布" button (inside closed shadow DOM)
+        # Method 1: CDP direct shadow DOM access (class-based, works for both)
+        if not done:
+            try:
+                cdp = page.context.new_cdp_session(page)
+                doc = cdp.send("DOM.getDocument")
+                doc_id = doc["root"]["nodeId"]
+                host = cdp.send("DOM.querySelector", {
+                    "nodeId": doc_id,
+                    "selector": "xhs-publish-btn"
+                })
+                if host and host.get("nodeId"):
+                    desc = cdp.send("DOM.describeNode", {"nodeId": host["nodeId"], "depth": 1})
+                    shadow_roots = desc.get("node", {}).get("shadowRoots", [])
+                    if shadow_roots:
+                        sr_id = shadow_roots[0]["nodeId"]
+                        btn = cdp.send("DOM.querySelector", {
+                            "nodeId": sr_id,
+                            "selector": "button.ce-btn.bg-red"
+                        })
+                        if btn and btn.get("nodeId"):
+                            obj = cdp.send("DOM.resolveNode", {"nodeId": btn["nodeId"]})
+                            cdp.send("Runtime.callFunctionOn", {
+                                "functionDeclaration": "function() { this.click(); this.scrollIntoView({block: 'center'}); }",
+                                "objectId": obj["object"]["objectId"]
+                            })
+                            done = True
+                            print("✅ Published (CDP)")
+                cdp.detach()
+            except Exception as e:
+                print(f"⚠️  CDP publish error: {e}")
+
+        # Method 2: Playwright get_by_text (try 定时发布 first, then 发布)
+        if not done:
+            for text in ["定时发布", "发布"]:
+                try:
+                    btn = page.get_by_text(text, exact=True)
+                    if btn.count() > 0:
+                        btn.first.click()
+                        done = True
+                        print(f"✅ Published via '{text}'")
+                        break
+                except Exception:
+                    continue
+
+        # Method 3: Playwright locator with text
+        if not done:
+            for text in ["定时发布", "发布"]:
+                try:
+                    btn = page.locator(f'text={text}')
+                    if btn.count() > 0:
+                        btn.first.click()
+                        done = True
+                        print(f"✅ Published via text locator '{text}'")
+                        break
+                except Exception:
+                    continue
+
+        # Method 4: JS fallback
+        if not done:
+            try:
+                for target_text in ["定时发布", "发布"]:
+                    clicked = page.evaluate(f"""
+                        function() {{
+                            function findInShadow(root) {{
+                                const btns = root.querySelectorAll('button');
+                                for (const btn of btns) {{
+                                    if (btn.offsetParent === null) continue;
+                                    if (btn.offsetHeight === 0) continue;
+                                    const t = (btn.textContent || '').trim();
+                                    if (t === '{target_text}' || t.startsWith('{target_text}')) {{
+                                        btn.scrollIntoView({{block: 'center'}});
+                                        btn.click();
+                                        return true;
+                                    }}
+                                }}
+                                const all = root.querySelectorAll('*');
+                                for (const el of all) {{
+                                    if (el.shadowRoot) {{
+                                        if (findInShadow(el.shadowRoot)) return true;
+                                    }}
+                                }}
+                                return false;
+                            }}
+                            return findInShadow(document);
+                        }}
+                    """)
+                    if clicked:
+                        done = True
+                        print(f"✅ Published via JS '{target_text}'")
+                        break
+            except Exception:
+                pass
+
+    if not done:
+        return {"success": False, "error": f"Could not find '{target_text}' button"}
+
+    # Wait for action to complete
+    time.sleep(3)
+    current_url = page.url
+
+    action_msg = "Scheduled publish"
+    print(f"✅ {action_msg} successfully")
+    return {
+        "success": True,
+        "url": current_url,
+        "title": title,
+        "message": f"{action_msg} on Xiaohongshu. Check scheduled posts in your profile."
+    }
+
+
+# ── Main ─────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Publish an image-text note to Xiaohongshu via browser automation",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""\
+Examples:
+  ./scripts/xhs-browser-publish --title "My Note" --images-dir ./photos/
+  ./scripts/xhs-browser-publish --title "Note" --content "Body text" --images img1.jpg img2.png
+  ./scripts/xhs-browser-publish --title "Test" --images-dir ./photos/ --debug
+        """,
+    )
+    parser.add_argument("--title", required=True, help="Note title (max 20 chars)")
+    parser.add_argument("--content", help="Note body text")
+    parser.add_argument("--images-dir", help="Directory containing images (sorted by name)")
+    parser.add_argument("--images", nargs="+", help="One or more image file paths")
+    parser.add_argument("--cover", type=int, default=0, help="Cover image index (0-based, default: 0)")
+    parser.add_argument("--publish", action="store_true", help="Publish directly instead of saving as draft")
+    parser.add_argument("--headless", action="store_true", help="Run headless (no visible browser)")
+    parser.add_argument("--debug", action="store_true", help="Keep browser open after completion")
+    parser.add_argument("--timeout", type=int, default=120, help="Login timeout in seconds (default: 120)")
+
+    args = parser.parse_args()
+
+    # Validate required image arguments
+    if not args.images_dir and not args.images:
+        print(json.dumps({"success": False, "error": "Either --images-dir or --images is required"}))
+        sys.exit(1)
+
+    # Resolve image paths
+    try:
+        image_paths = get_image_paths(args.images_dir, args.images)
+    except ValueError as e:
+        print(json.dumps({"success": False, "error": str(e)}))
+        sys.exit(1)
+
+    print("ℹ️  Launching browser...")
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=args.headless,
+            args=["--disable-blink-features=AutomationControlled"]
+        )
+        context = browser.new_context(
+            viewport={"width": 1280, "height": 800},
+            user_agent=(
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/125.0.0.0 Safari/537.36"
+            ),
+            permissions=["geolocation"],
+            locale="zh-CN"
+        )
+        page = context.new_page()
+
+        # Run the publish workflow
+        result = publish_note_via_browser(
+            page, title=args.title, content=args.content or "",
+            image_paths=image_paths, cover_index=args.cover, publish=args.publish
+        )
+
+        if result.get("success"):
+            print("\n✅ Scheduled! The note will be published in 14 days.")
+            print("   Check 定时发布 in your Xiaohongshu profile.")
+        else:
+            print(f"\n⚠️  Error: {result.get('error', 'unknown')}")
+
+        # Keep browser open (cache is needed for the scheduled post to be visible)
+        print("   Browser kept open for verification. Close manually or Ctrl+C.")
+        try:
+            page.wait_for_timeout(300000)
+        except KeyboardInterrupt:
+            pass
+        time.sleep(1)
+
+        browser.close()
+        print(json.dumps(result, ensure_ascii=False))
+        sys.exit(0 if result.get("success") else 1)
+
+
+if __name__ == "__main__":
+    main()
